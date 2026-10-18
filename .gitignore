@@ -1,7 +1,6 @@
 node_modules
 dist
 target
-.env
 .DS_Store
 coverage
 e2e-results
@@ -17,3 +16,7 @@ issue*.md
 pr*.md
 ISSUE_*.md
 PR_*.md
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+config.bat
