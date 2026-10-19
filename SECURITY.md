@@ -1,5 +1,7 @@
 # Security Policy
 
+This is the canonical security policy for FlowFi. It defines how vulnerabilities are reported, which versions are supported, and the responsible disclosure process. For contributors and administrators setting up repository security features, see [SECURITY_IMPLEMENTATION_SUMMARY.md](SECURITY_IMPLEMENTATION_SUMMARY.md). For the GitHub setup checklist, see [.github/SECURITY_SETUP_CHECKLIST.md](.github/SECURITY_SETUP_CHECKLIST.md).
+
 ## Supported Versions
 
 We actively support the following versions of FlowFi with security updates:
@@ -17,11 +19,15 @@ We take the security of FlowFi seriously. If you discover a security vulnerabili
 
 **Please do not report security vulnerabilities through public GitHub issues.**
 
-Instead, please report security vulnerabilities by:
+The preferred and fastest way to report a vulnerability is **GitHub Security Advisories**:
 
-1. **Email**: Send details to `security@flowfi.dev` (if available) or create a private security advisory on GitHub
-2. **GitHub Security Advisory**: Use GitHub's [private vulnerability reporting](https://github.com/LabsCrypt/flowfi/security/advisories/new) feature
-3. **Direct Contact**: Reach out to the maintainers directly through GitHub
+1. Go to the [Security tab](https://github.com/LabsCrypt/flowfi/security) of this repository.
+2. Click **"Report a vulnerability"** (or use the direct link: [Report a vulnerability](https://github.com/LabsCrypt/flowfi/security/advisories/new)).
+3. Fill in the private advisory form with as much detail as possible (see "What to Include" below).
+
+This opens a private channel between you and the maintainers — nothing is visible publicly until we agree on a disclosure timeline.
+
+If you cannot use GitHub Security Advisories for any reason, you may instead reach out to the maintainers directly through the [community Telegram](https://t.me/+DOylgFv1jyJlNzM0) and request a private contact, or send a message via GitHub Discussions asking to be contacted privately (do not include vulnerability details in the public message).
 
 ### What to Include
 
@@ -41,6 +47,10 @@ We are committed to responding to security reports promptly:
 - **Initial Response**: Within 48 hours of receiving your report
 - **Status Update**: Within 7 days with our assessment and planned timeline
 - **Resolution**: We aim to resolve critical vulnerabilities within 30 days
+
+These targets apply to every reporting channel — private GitHub Security Advisories and non-sensitive public reports filed with the [security issue template](.github/ISSUE_TEMPLATE/security.md), which restates the same timeline. If you update one, update the other so they do not drift.
+
+If you have not heard from us within 48 hours, please reach out through our [community Telegram](https://t.me/+DOylgFv1jyJlNzM0).
 
 ### Disclosure Policy
 
@@ -102,7 +112,7 @@ Security updates and advisories will be published:
 
 For security-related questions or concerns that are not vulnerabilities, you can:
 
-- Open a public issue with the `security` label
+- Open a public issue with the `security` label using the [security issue template](.github/ISSUE_TEMPLATE/security.md)
 - Reach out to the maintainers through GitHub
 - Join our community discussions
 
