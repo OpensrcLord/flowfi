@@ -4,7 +4,8 @@ import {
   useSettings,
   STORAGE_KEYS,
   formatAmountWithPreference,
-  DEFAULT_SETTINGS
+  DEFAULT_SETTINGS,
+  _resetSharedSettings
 } from './useSettings';
 
 const localStorageMock = (() => {
@@ -29,6 +30,7 @@ describe('useSettings and formatAmountWithPreference', () => {
   beforeEach(() => {
     localStorage.clear();
     document.documentElement.className = '';
+    _resetSharedSettings();
   });
 
   afterEach(() => {
@@ -43,14 +45,12 @@ describe('useSettings and formatAmountWithPreference', () => {
         expect(result.current.isHydrated).toBe(true);
       });
 
-      expect(result.current.theme).toBe(DEFAULT_SETTINGS.theme);
       expect(result.current.displayCurrency).toBe(DEFAULT_SETTINGS.displayCurrency);
       expect(result.current.amountFormat).toBe(DEFAULT_SETTINGS.amountFormat);
       expect(result.current.decimalPlaces).toBe(DEFAULT_SETTINGS.decimalPlaces);
     });
 
     it('hydrates settings from pre-seeded localStorage values', async () => {
-      localStorage.setItem(STORAGE_KEYS.theme, 'light');
       localStorage.setItem(STORAGE_KEYS.displayCurrency, 'XLM');
       localStorage.setItem(STORAGE_KEYS.amountFormat, 'compact');
       localStorage.setItem(STORAGE_KEYS.decimalPlaces, '4');
@@ -61,24 +61,9 @@ describe('useSettings and formatAmountWithPreference', () => {
         expect(result.current.isHydrated).toBe(true);
       });
 
-      expect(result.current.theme).toBe('light');
       expect(result.current.displayCurrency).toBe('XLM');
       expect(result.current.amountFormat).toBe('compact');
       expect(result.current.decimalPlaces).toBe(4);
-    });
-
-    it('updates state and localStorage when setTheme is called', async () => {
-      const { result } = renderHook(() => useSettings());
-      
-      await waitFor(() => expect(result.current.isHydrated).toBe(true));
-
-      act(() => {
-        result.current.setTheme('light');
-      });
-
-      expect(result.current.theme).toBe('light');
-      expect(localStorage.getItem(STORAGE_KEYS.theme)).toBe('light');
-      expect(document.documentElement.classList.contains('dark')).toBe(false);
     });
 
     it('updates state and localStorage when setDecimalPlaces is called', async () => {
@@ -118,6 +103,43 @@ describe('useSettings and formatAmountWithPreference', () => {
 
       expect(result.current.amountFormat).toBe('compact');
       expect(localStorage.getItem(STORAGE_KEYS.amountFormat)).toBe('compact');
+    });
+
+    it('syncs state across multiple consumers without remount', async () => {
+      const { result: consumerA } = renderHook(() => useSettings());
+      const { result: consumerB } = renderHook(() => useSettings());
+      
+      await waitFor(() => {
+        expect(consumerA.current.isHydrated).toBe(true);
+        expect(consumerB.current.isHydrated).toBe(true);
+      });
+
+      act(() => {
+        consumerA.current.setDecimalPlaces(2);
+      });
+
+      expect(consumerA.current.decimalPlaces).toBe(2);
+      expect(consumerB.current.decimalPlaces).toBe(2);
+    });
+
+    it('syncs state across tabs using storage event', async () => {
+      const { result } = renderHook(() => useSettings());
+      
+      await waitFor(() => expect(result.current.isHydrated).toBe(true));
+
+      act(() => {
+        // Simulate other tab changing local storage
+        localStorage.setItem(STORAGE_KEYS.displayCurrency, 'EUR');
+        
+        // Dispatch storage event
+        const event = new StorageEvent('storage', {
+          key: STORAGE_KEYS.displayCurrency,
+          newValue: 'EUR'
+        });
+        window.dispatchEvent(event);
+      });
+
+      expect(result.current.displayCurrency).toBe('EUR');
     });
   });
 

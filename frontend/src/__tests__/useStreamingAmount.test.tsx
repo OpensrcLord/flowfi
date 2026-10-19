@@ -39,7 +39,10 @@ describe("useStreamingAmount", () => {
       isActive: true,
     };
 
-    const { result, rerender } = renderHook(
+    const { result, rerender } = renderHook<
+      number,
+      { deposited: number; withdrawn: number; ratePerSecond: number; startTime?: number; lastUpdateTime?: number; isActive: boolean }
+    >(
       (props) => useStreamingAmount(props),
       { initialProps: params }
     );
@@ -62,6 +65,7 @@ describe("useStreamingAmount", () => {
       deposited: 1000,
       withdrawn: 110,
       ratePerSecond: 1,
+      startTime: undefined as number | undefined,
       lastUpdateTime: 1000 * 1000 + 10,
       isActive: true,
     };
@@ -84,5 +88,42 @@ describe("useStreamingAmount", () => {
     });
     // Claimable must be capped at 890
     expect(result.current).toBe(890);
+  });
+
+  it("pauses recomputation while the tab is hidden and resyncs when visible again", () => {
+    const params = {
+      deposited: 1000,
+      withdrawn: 0,
+      ratePerSecond: 1,
+      startTime: 1000 * 1000 - 100, // started 100 seconds ago
+      isActive: true,
+    };
+
+    const { result } = renderHook((props) => useStreamingAmount(props), {
+      initialProps: params,
+    });
+
+    expect(result.current).toBe(100);
+
+    // Hide the tab and advance time — the displayed value should not tick.
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: () => true,
+    });
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      vi.advanceTimersByTime(10000);
+    });
+    expect(result.current).toBe(100);
+
+    // Reveal the tab again — the value should resync to the true elapsed time.
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: () => false,
+    });
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(result.current).toBeCloseTo(110, 1);
   });
 });
