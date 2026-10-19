@@ -1,32 +1,165 @@
+import { randomUUID } from 'crypto';
 import type { Response } from 'express';
-import logger from '../logger.js';
+import logger, { requestContext } from '../logger.js';
 import { isRedisAvailable, getPublisher, getSubscriber } from '../lib/redis.js';
+import {
+  sseClientsDroppedTotal,
+  sseConnectionsTotal,
+  sseMaxConnections,
+  setSseConnectionCounts,
+} from '../lib/metrics.js';
 
-const HEARTBEAT_INTERVAL_MS = 30_000;
+// Kept well under the 60s idle timeout of common proxies/load balancers
+// (Nginx, Cloudflare, AWS ALB) so silent streams are not dropped.
+export const HEARTBEAT_INTERVAL_MS = 25_000;
+export const HEARTBEAT_MESSAGE = ': keepalive\n\n';
 const MAX_WRITABLE_BUFFER = 64 * 1024;
+const MAX_CONNECTIONS_PER_IP = 5;
+const MAX_CONNECTIONS_PER_USER = 10;
+const RETRY_AFTER_SECONDS = 60;
 
 interface SSEClient {
   id: string;
   res: Response;
   subscriptions: Set<string>;
   paused: boolean;
+  ip: string;
+  userId?: string;
+  /**
+   * Issue #1535: clients connected with sandbox mode receive every event
+   * tagged with `_sandbox: true` so test subscriptions are clearly
+   * distinguishable from production traffic.
+   */
+  sandbox: boolean;
+}
+
+interface SSECapacityCheckResult {
+  allowed: boolean;
+  status?: number;
+  retryAfterSeconds?: number;
+  message?: string;
 }
 
 export class SSEService {
   private clients: Map<string, SSEClient> = new Map();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private slowClientsDropped = 0;
+  private readonly ipConnectionCounts: Map<string, number> = new Map();
+  private readonly userConnectionCounts: Map<string, number> = new Map();
+  private shuttingDown = false;
+  private perIpPeakConnections = 0;
+  private perUserPeakConnections = 0;
+
+  /**
+   * Stable id attached to every log line emitted by the heartbeat
+   * setInterval callback, since it fires outside of any HTTP request and
+   * would otherwise have no requestContext (and thus no correlation id).
+   */
+  private readonly heartbeatWorkerId = `sse-heartbeat:${randomUUID()}`;
+
+  private readonly maxConnections: number = (() => {
+    const parsed = Number.parseInt(process.env.MAX_SSE_CONNECTIONS ?? '10000', 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) return 10000;
+    return parsed;
+  })();
+
+  isShuttingDown(): boolean {
+    return this.shuttingDown;
+  }
+
+  async initRedisSubscription(): Promise<void> {
+    const sub = getSubscriber();
+    if (!sub) return;
+
+    await sub.psubscribe('sse:stream:*', 'sse:user:*');
+    sub.on('pmessage', (_pattern: string, channel: string, message: string) => {
+      try {
+        const { event, data } = JSON.parse(message) as { event: string; data: unknown };
+        if (channel.startsWith('sse:stream:')) {
+          this._localBroadcastToStream(channel.slice('sse:stream:'.length), event, data);
+        } else if (channel.startsWith('sse:user:')) {
+          this._localBroadcastToUser(channel.slice('sse:user:'.length), event, data);
+        }
+      } catch (err) {
+        logger.warn('[Redis SSE] Failed to handle pub/sub message:', err);
+      }
+    });
+
+    logger.info('[SSEService] Redis pub/sub subscription active.');
+  }
+
+  checkCapacity(ip: string, userId?: string): SSECapacityCheckResult {
+    if (this.clients.size >= this.maxConnections) {
+      sseClientsDroppedTotal.inc({ reason: 'capacity' });
+      return {
+        allowed: false,
+        status: 503,
+        message: 'SSE capacity reached. Please try again shortly.',
+      };
+    }
+
+    const currentIpConnections = this.ipConnectionCounts.get(ip) ?? 0;
+    if (currentIpConnections >= MAX_CONNECTIONS_PER_IP) {
+      sseClientsDroppedTotal.inc({ reason: 'per_ip_limit' });
+      return {
+        allowed: false,
+        status: 429,
+        retryAfterSeconds: RETRY_AFTER_SECONDS,
+        message: `Too many SSE connections from this IP. Max ${MAX_CONNECTIONS_PER_IP}.`,
+      };
+    }
+
+    // Independent of the per-IP cap: bounds how many concurrent SSE
+    // subscriptions a single authenticated user can hold regardless of which
+    // IP(s) they connect from (e.g. multiple tabs/devices behind different NATs).
+    if (userId) {
+      const currentUserConnections = this.userConnectionCounts.get(userId) ?? 0;
+      if (currentUserConnections >= MAX_CONNECTIONS_PER_USER) {
+        return {
+          allowed: false,
+          status: 429,
+          retryAfterSeconds: RETRY_AFTER_SECONDS,
+          message: `Too many concurrent SSE connections for this user. Max ${MAX_CONNECTIONS_PER_USER}.`,
+        };
+      }
+    }
+
+    return { allowed: true };
+  }
+
+  addClient(
+    clientId: string,
+    res: Response,
+    subscriptions: string[] = [],
+    ip = 'unknown',
+    userId?: string,
+    sandbox = false,
+  ): void {
+    const nextIpCount = (this.ipConnectionCounts.get(ip) ?? 0) + 1;
+    this.ipConnectionCounts.set(ip, nextIpCount);
+    this.perIpPeakConnections = Math.max(this.perIpPeakConnections, nextIpCount);
+
+    if (userId) {
+      const nextUserCount = (this.userConnectionCounts.get(userId) ?? 0) + 1;
+      this.userConnectionCounts.set(userId, nextUserCount);
+      this.perUserPeakConnections = Math.max(this.perUserPeakConnections, nextUserCount);
+    }
 
     const client: SSEClient = {
       id: clientId,
       res,
       subscriptions: new Set(subscriptions),
       paused: false,
+      ip,
+      sandbox,
+      ...(userId !== undefined && { userId }),
     };
 
     this.clients.set(clientId, client);
+    sseConnectionsTotal.inc();
+    this.publishConnectionMetrics();
     logger.info(
-      `[SSEService] Connection opened: ${clientId}, ip: ${ip}, subscriptions: ${subscriptions.join(', ')}`
+      `[SSEService] Connection opened: ${clientId}, ip: ${ip}, userId: ${userId ?? 'n/a'}, sandbox: ${sandbox}, subscriptions: ${subscriptions.join(', ')}`
     );
 
     res.on('close', () => {
@@ -36,31 +169,97 @@ export class SSEService {
     this.ensureHeartbeat();
   }
 
-  sendHeartbeat(): void {
-    const message = ': heartbeat\n\n';
-
+  /**
+   * Re-derive the per-topic connection gauges from the live client map.
+   *
+   * Recomputing from source (rather than incrementing/decrementing per event)
+   * keeps the gauges correct across slow-client drops, write failures and
+   * disconnect races, all of which can reach `removeClient` from more than one
+   * path.
+   */
+  private publishConnectionMetrics(): void {
+    const countsByTopic = new Map<string, number>();
     for (const client of this.clients.values()) {
-      this.writeToClient(client, message);
+      for (const topic of client.subscriptions) {
+        countsByTopic.set(topic, (countsByTopic.get(topic) ?? 0) + 1);
+      }
+    }
+
+    setSseConnectionCounts(countsByTopic, this.clients.size);
+  }
+
+  sendHeartbeat(): void {
+    // writeToClient prunes clients whose write throws or who are too slow,
+    // which may in turn stop the timer once the last client is gone.
+    for (const client of this.clients.values()) {
+      this.writeToClient(client, HEARTBEAT_MESSAGE);
     }
   }
 
+  sendReconnectToAll(): void {
+    this.shuttingDown = true;
+    this.stopHeartbeat();
+    const message = 'event: reconnect\ndata: {}\n\n';
+    for (const client of this.clients.values()) {
+      try {
+        client.res.write(message);
+      } catch {
+        // ignore write errors during shutdown
+      }
+    }
+    logger.info(`[SSEService] Sent reconnect to ${this.clients.size} client(s).`);
+  }
+
   broadcast(event: string, data: unknown, filter?: (client: SSEClient) => boolean): void {
-    const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    const isObjectPayload = data !== null && typeof data === 'object';
 
     for (const client of this.clients.values()) {
-      if (!filter || filter(client)) {
-        this.writeToClient(client, message);
+      if (filter && !filter(client)) {
+        continue;
       }
+
+      // Sandbox clients get every event tagged with `_sandbox: true` so the
+      // isolation is observable end-to-end (issue #1535). Production clients
+      // receive the payload untouched.
+      const payload =
+        client.sandbox && isObjectPayload
+          ? { ...(data as Record<string, unknown>), _sandbox: true }
+          : data;
+
+      this.writeToClient(client, `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
     }
   }
 
   broadcastToStream(streamId: string, event: string, data: unknown): void {
+    if (isRedisAvailable()) {
+      getPublisher()?.publish(`sse:stream:${streamId}`, JSON.stringify({ event, data }));
+    } else {
+      this._localBroadcastToStream(streamId, event, data);
+    }
+  }
+
+  broadcastToUser(publicKey: string, event: string, data: unknown): void {
+    if (isRedisAvailable()) {
+      getPublisher()?.publish(`sse:user:${publicKey}`, JSON.stringify({ event, data }));
+    } else {
+      this._localBroadcastToUser(publicKey, event, data);
+    }
+  }
+
+  broadcastToAdmin(event: string, data: unknown): void {
+    const adminKey = process.env.ADMIN_PUBLIC_KEY;
+    if (adminKey) {
+      this.broadcastToUser(adminKey, event, data);
+    }
+  }
+
+  private _localBroadcastToStream(streamId: string, event: string, data: unknown): void {
     this.broadcast(event, data, (client) =>
       client.subscriptions.has(streamId) || client.subscriptions.has('*')
     );
   }
 
-  broadcastToUser(publicKey: string, event: string, data: unknown): void {
+  private _localBroadcastToUser(publicKey: string, event: string, data: unknown): void {
     this.broadcast(event, data, (client) =>
       client.subscriptions.has(`user:${publicKey}`) || client.subscriptions.has('*')
     );
@@ -74,6 +273,30 @@ export class SSEService {
     return this.slowClientsDropped;
   }
 
+  getMaxConnections(): number {
+    return this.maxConnections;
+  }
+
+  getPerIpPeakConnections(): number {
+    return this.perIpPeakConnections;
+  }
+
+  getActiveIpCount(): number {
+    return this.ipConnectionCounts.size;
+  }
+
+  getPerUserPeakConnections(): number {
+    return this.perUserPeakConnections;
+  }
+
+  getActiveUserCount(): number {
+    return this.userConnectionCounts.size;
+  }
+
+  getUserConnectionCount(userId: string): number {
+    return this.userConnectionCounts.get(userId) ?? 0;
+  }
+
   stopHeartbeat(): void {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
@@ -81,13 +304,19 @@ export class SSEService {
     }
   }
 
+  isHeartbeatRunning(): boolean {
+    return this.heartbeatTimer !== null;
+  }
+
   private ensureHeartbeat(): void {
-    if (this.heartbeatTimer) {
+    if (this.heartbeatTimer || this.shuttingDown) {
       return;
     }
 
     this.heartbeatTimer = setInterval(() => {
-      this.sendHeartbeat();
+      requestContext.run({ requestId: this.heartbeatWorkerId }, () => {
+        this.sendHeartbeat();
+      });
     }, HEARTBEAT_INTERVAL_MS);
   }
 
@@ -107,6 +336,28 @@ export class SSEService {
     }
 
     this.clients.delete(clientId);
+    this.publishConnectionMetrics();
+
+    // No one left to keep alive; addClient restarts the timer on demand.
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
+    }
+
+    const currentIpCount = this.ipConnectionCounts.get(client.ip) ?? 0;
+    if (currentIpCount <= 1) {
+      this.ipConnectionCounts.delete(client.ip);
+    } else {
+      this.ipConnectionCounts.set(client.ip, currentIpCount - 1);
+    }
+
+    if (client.userId) {
+      const currentUserCount = this.userConnectionCounts.get(client.userId) ?? 0;
+      if (currentUserCount <= 1) {
+        this.userConnectionCounts.delete(client.userId);
+      } else {
+        this.userConnectionCounts.set(client.userId, currentUserCount - 1);
+      }
+    }
 
     try {
       if (!client.res.writableEnded) {
@@ -123,6 +374,7 @@ export class SSEService {
 
   private dropSlowClient(client: SSEClient): void {
     this.slowClientsDropped += 1;
+    sseClientsDroppedTotal.inc({ reason: 'slow_client' });
     this.removeClient(client.id, 'slow-client');
   }
 
@@ -158,3 +410,8 @@ export class SSEService {
 
 export const sseService = new SSEService();
 export type { SSEClient };
+
+// Publish the configured ceiling once at import time so
+// `flowfi_sse_max_connections / flowfi_sse_active_connections{topic="total"}`
+// is a usable saturation ratio even before the first client connects.
+sseMaxConnections.set(sseService.getMaxConnections());
