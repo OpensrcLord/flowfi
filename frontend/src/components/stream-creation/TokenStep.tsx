@@ -1,5 +1,7 @@
 "use client";
 import React from "react";
+import { TOKEN_ADDRESSES } from "@/lib/soroban";
+import { TokenAvatar } from "../TokenAvatar";
 
 interface TokenStepProps {
   value: string;
@@ -7,7 +9,12 @@ interface TokenStepProps {
   error?: string;
 }
 
-const TOKENS = [
+const TOKENS: {
+  id: keyof typeof TOKEN_ADDRESSES;
+  name: string;
+  symbol: string;
+  description: string;
+}[] = [
   { id: "USDC", name: "USDC", symbol: "USDC", description: "USD Coin" },
   { id: "XLM", name: "Stellar Lumens", symbol: "XLM", description: "Native Stellar token" },
   { id: "EURC", name: "EURC", symbol: "EURC", description: "Euro Coin" },
@@ -21,19 +28,26 @@ export const TokenStep: React.FC<TokenStepProps> = ({
   return (
     <div className="space-y-4">
       <div>
-        <h3 className="text-xl font-semibold mb-2">Select Token</h3>
+        <h3 id="token-group-label" className="text-xl font-semibold mb-2">Select Token</h3>
         <p className="text-sm text-slate-400 mb-4">
           Choose the token you want to stream to the recipient.
         </p>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div 
+        className="grid grid-cols-1 md:grid-cols-3 gap-4"
+        role="radiogroup"
+        aria-labelledby="token-group-label"
+        aria-describedby={error ? "token-error" : undefined}
+      >
         {TOKENS.map((token) => {
           const isSelected = value === token.id;
           return (
             <button
               key={token.id}
               type="button"
+              role="radio"
+              aria-checked={isSelected}
               onClick={() => onChange(token.id)}
               className={`p-4 rounded-lg border-2 transition-all text-left ${
                 isSelected
@@ -42,7 +56,15 @@ export const TokenStep: React.FC<TokenStepProps> = ({
               }`}
             >
               <div className="flex items-center justify-between mb-2">
-                <span className="font-semibold text-lg">{token.symbol}</span>
+                <span className="flex items-center gap-2">
+                  <TokenAvatar
+                    symbol={token.symbol}
+                    address={TOKEN_ADDRESSES[token.id]}
+                    size={28}
+                    decorative
+                  />
+                  <span className="font-semibold text-lg">{token.symbol}</span>
+                </span>
                 {isSelected && (
                   <svg
                     className="w-5 h-5 text-accent"
@@ -68,6 +90,7 @@ export const TokenStep: React.FC<TokenStepProps> = ({
 
       {error && (
         <p
+          id="token-error"
           className="mt-2 text-sm text-red-400 flex items-center gap-1"
           role="alert"
         >

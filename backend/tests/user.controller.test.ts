@@ -4,6 +4,7 @@ import { prisma } from '../src/lib/prisma.js';
 import type { Request, Response } from 'express';
 
 vi.mock('../src/lib/prisma.js', () => ({
+  withReplicaFallback: (query: (client: any) => unknown) => Promise.resolve(query(prisma)),
   prisma: {
     user: {
       findUnique: vi.fn(),
@@ -75,8 +76,30 @@ describe('User Controller', () => {
   });
 
   describe('getUser', () => {
+    it('should return 400 if publicKey is missing', async () => {
+      req.params = {};
+
+      await getUser(req as Request, res as Response, next);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({
+        error: { code: 'INVALID_PUBLIC_KEY', message: 'Invalid publicKey parameter' },
+      });
+    });
+
+    it('should return 400 if publicKey is malformed', async () => {
+      req.params = { publicKey: 'invalid-key' };
+
+      await getUser(req as Request, res as Response, next);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({
+        error: { code: 'INVALID_PUBLIC_KEY', message: 'Invalid Stellar public key format' },
+      });
+    });
+
     it('should return 404 if user not found', async () => {
-      req.params = { publicKey: 'GNOTFOUND' };
+      req.params = { publicKey: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ' };
       (prisma.user.findUnique as any).mockResolvedValue(null);
 
       await getUser(req as Request, res as Response, next);
@@ -85,8 +108,9 @@ describe('User Controller', () => {
     });
 
     it('should return user if found', async () => {
-      req.params = { publicKey: 'GUSER1' };
-      const mockUser = { publicKey: 'GUSER1', sentStreams: [], receivedStreams: [] };
+      const publicKey = 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ';
+      req.params = { publicKey };
+      const mockUser = { publicKey, sentStreams: [], receivedStreams: [] };
       (prisma.user.findUnique as any).mockResolvedValue(mockUser);
 
       await getUser(req as Request, res as Response, next);
@@ -94,15 +118,61 @@ describe('User Controller', () => {
       expect(res.status).toHaveBeenCalledWith(200);
       expect(res.json).toHaveBeenCalledWith(mockUser);
     });
+
+    it('should query with an explicit select clause excluding internal-only fields', async () => {
+      const publicKey = 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ';
+      req.params = { publicKey };
+      const mockUser = { id: 'uuid-1', publicKey, createdAt: new Date(), updatedAt: new Date(), sentStreams: [], receivedStreams: [] };
+      (prisma.user.findUnique as any).mockResolvedValue(mockUser);
+
+      await getUser(req as Request, res as Response, next);
+
+      const call = (prisma.user.findUnique as any).mock.calls[0][0];
+      expect(call.select).toBeDefined();
+      expect(call.include).toBeUndefined();
+
+      const jsonArg = (res.json as any).mock.calls[0][0];
+      expect(jsonArg).not.toHaveProperty('passwordHash');
+      expect(jsonArg).not.toHaveProperty('internalNotes');
+      expect(jsonArg).not.toHaveProperty('apiSecret');
+    });
   });
 
   describe('getUserEvents', () => {
+    // Issue #1533: the endpoint is authenticated and scoped to the caller.
+    const VIEWER = 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ';
+
+    beforeEach(() => {
+      (req as any).user = { publicKey: VIEWER };
+    });
+
+    it('returns 401 when the request is unauthenticated (#1533)', async () => {
+      req.params = { publicKey: VIEWER };
+      delete (req as any).user;
+
+      await getUserEvents(req as Request, res as Response, next);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(prisma.streamEvent.findMany).not.toHaveBeenCalled();
+    });
+
+    it('returns 403 when requesting another wallet\'s history (#1533)', async () => {
+      req.params = { publicKey: 'GCNO64M4RVXL4QA43XCMQHA4S2MYUWLFEAYS6OQUXNA4EFC7XUMXBBEY' };
+
+      await getUserEvents(req as Request, res as Response, next);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(prisma.streamEvent.findMany).not.toHaveBeenCalled();
+    });
+
     it('should return 400 if publicKey is missing', async () => {
       req.params = {};
       await getUserEvents(req as Request, res as Response, next);
 
       expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({ error: 'Invalid publicKey parameter' });
+      expect(res.json).toHaveBeenCalledWith({
+        error: { code: 'INVALID_PUBLIC_KEY', message: 'Invalid publicKey parameter' },
+      });
     });
 
     it('should return 400 if publicKey is malformed', async () => {
@@ -110,7 +180,9 @@ describe('User Controller', () => {
       await getUserEvents(req as Request, res as Response, next);
 
       expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({ error: 'Invalid Stellar public key format' });
+      expect(res.json).toHaveBeenCalledWith({
+        error: { code: 'INVALID_PUBLIC_KEY', message: 'Invalid Stellar public key format' },
+      });
     });
 
     it('should return 400 if publicKey has wrong format (too short)', async () => {
@@ -118,7 +190,9 @@ describe('User Controller', () => {
       await getUserEvents(req as Request, res as Response, next);
 
       expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({ error: 'Invalid Stellar public key format' });
+      expect(res.json).toHaveBeenCalledWith({
+        error: { code: 'INVALID_PUBLIC_KEY', message: 'Invalid Stellar public key format' },
+      });
     });
 
     it('should return paginated events', async () => {
@@ -130,12 +204,64 @@ describe('User Controller', () => {
       await getUserEvents(req as Request, res as Response, next);
 
       expect(res.status).toHaveBeenCalledWith(200);
+      expect(prisma.streamEvent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: { timestamp: 'desc' },
+        }),
+      );
       expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
         data: [],
         total: 0,
         limit: 10,
         offset: 0
       }));
+    });
+
+    it('includes the related stream by default', async () => {
+      req.params = { publicKey: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ' };
+      req.query = {};
+      (prisma.streamEvent.findMany as any).mockResolvedValue([]);
+      (prisma.streamEvent.count as any).mockResolvedValue(0);
+
+      await getUserEvents(req as Request, res as Response, next);
+
+      expect(prisma.streamEvent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ include: { stream: true } }),
+      );
+    });
+
+    it('omits the related stream when includeStream=false', async () => {
+      req.params = { publicKey: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ' };
+      req.query = { includeStream: 'false' };
+      (prisma.streamEvent.findMany as any).mockResolvedValue([]);
+      (prisma.streamEvent.count as any).mockResolvedValue(0);
+
+      await getUserEvents(req as Request, res as Response, next);
+
+      const callArgs = (prisma.streamEvent.findMany as any).mock.calls[0][0];
+      expect(callArgs.include).toBeUndefined();
+    });
+
+    it('forwards a comma-separated type filter to the shared query helper', async () => {
+      req.params = { publicKey: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ' };
+      req.query = { type: 'PAUSED,RESUMED' };
+      (prisma.streamEvent.findMany as any).mockResolvedValue([]);
+      (prisma.streamEvent.count as any).mockResolvedValue(0);
+
+      await getUserEvents(req as Request, res as Response, next);
+
+      const callArgs = (prisma.streamEvent.findMany as any).mock.calls[0][0];
+      expect(callArgs.where.eventType).toEqual({ in: ['PAUSED', 'RESUMED'] });
+    });
+
+    it('returns 400 when the type filter has no valid values', async () => {
+      req.params = { publicKey: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ' };
+      req.query = { type: 'BOGUS' };
+
+      await getUserEvents(req as Request, res as Response, next);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(prisma.streamEvent.findMany).not.toHaveBeenCalled();
     });
   });
 
