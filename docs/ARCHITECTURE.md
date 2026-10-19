@@ -165,8 +165,18 @@ Benefits:
 ## Operational Notes
 
 1. `/v1/events/stats` exposes active SSE connections and connection-capacity metrics.
-1. Admin metrics include SSE peak-per-IP visibility for abuse monitoring.
-1. User summary endpoint (`/v1/users/{address}/summary`) is cached for 30s to protect DB hot paths.
+2. Admin metrics include SSE peak-per-IP visibility for abuse monitoring.
+3. User summary endpoint (`/v1/users/{address}/summary`) is cached for 30s to protect DB hot paths.
+
+---
+
+## Logging & Observability
+
+All backend log lines use standard JSON formatting via Winston and include a `requestId` correlation ID field when running inside a request or worker context (managed by Node's `AsyncLocalStorage` via `requestContext` in `backend/src/logger.ts`).
+
+- **HTTP Requests:** Requests receive or generate a `requestId` via `requestIdMiddleware` (`X-Request-ID` header).
+- **Background Indexer/Worker Poll Cycles:** Each `SorobanEventWorker` poll batch runs inside `requestContext.run({ requestId: randomUUID() }, ...)` so all RPC fetches, event processing, and per-event error logs within that poll cycle share a single correlation ID.
+- **Admin Replays:** Triggering an indexer event replay (via `replayFromLedger` or `POST /v1/admin/indexer/replay`) wraps the reset and worker poll cycle in `requestContext`. The correlation ID is included on all log statements emitted during replay and returned in the HTTP API response (`{ ok: true, replayingFrom: <ledger>, requestId: "<id>" }`).
 
 ---
 
@@ -192,6 +202,22 @@ Frontend useStreamEvents hook  (frontend/src/hooks/useStreamEvents.ts)
     ▼
 Dashboard / NotificationDropdown  re-render with live data
 ```
+
+### Indexer Ownership & Naming
+
+Two files share the `indexer` name, but only one of them is the indexer that writes stream state. This section documents which is the source of truth so contributors know where to start when debugging indexing.
+
+| File | Role | Status |
+|------|------|--------|
+| `backend/src/workers/soroban-event-worker.ts` (`SorobanEventWorker`) | **Source-of-truth indexer.** Polls Soroban RPC, decodes XDR, persists `Stream` / `StreamEvent`, advances the `IndexerState` cursor, and broadcasts SSE. | Active / source of truth. Started by `backend/src/workers/index.ts` |
+| `backend/src/services/indexerService.ts` | **Not an indexer at all.** Admin control-plane helpers (`getIndexerStatus`, `resetIndexer`, `replayFromLedger`) that read/reset `IndexerState` and trigger the worker's poll loop. | Active. The name is misleading. |
+
+Key points:
+
+1. **When debugging indexing, read `backend/src/workers/soroban-event-worker.ts` first.** It is the only file that persists canonical stream state.
+2. **`indexerService.ts` is control-plane only** — it never reads the chain; it manages the shared cursor and triggers replays.
+
+**Naming convention plan:** the team convention is kebab-case with a `.service.ts` suffix (e.g. `claimable.service.ts`, `sse.service.ts`). The helper file `indexerService.ts` breaks that convention and is also a misleading name. It is expected to be renamed to `indexer.service.ts`.
 
 ### Deduplication
 
@@ -226,12 +252,18 @@ FlowFi actions split into two categories based on who holds the signing key:
 
 | Action | Signer | How |
 |---|---|---|
-| **Top-up** | Server (custodial) | Backend submits the transaction using `KEEPER_SECRET_KEY`. The frontend sends only the stream ID and amount. |
+| **Top-up** | Server (custodial) | Backend submits the transaction using `KEEPER_SECRET_KEY`. The frontend sends only the stream ID and amount. This is the only action signed with a key the backend holds. |
+| **Cancel** | Sender wallet (non-custodial) | `backend/src/controllers/stream/cancel.ts` submits the on-chain cancel server-side, but signs it with the sender's secret supplied in the request body (`senderSecret`) — never `KEEPER_SECRET_KEY`. Returns `400` if `senderSecret` is missing. |
 | **Withdraw** | Wallet (non-custodial) | Frontend builds and signs the transaction via the connected wallet (Freighter). The backend currently only simulates server-side; the real transaction is signed and submitted by the frontend. |
 | **Pause / Resume** | Wallet (non-custodial) | Same as withdraw — frontend-signed. The backend simulate endpoints exist for fee estimation but do not submit. |
 | **Create stream** | Wallet (non-custodial) | Frontend signs via wallet and submits directly to the RPC. |
 
-> **Important for contributors:** Do not wire pause/resume/withdraw to a server-side submit path. Only `top-up` is intentionally custodial. All other mutating actions must be wallet-signed by the user.
+> **Important for contributors:** `top-up` is the only action the backend can sign with a key it holds (`KEEPER_SECRET_KEY`). Every other mutating action must be authorized by the user's own key: pause/resume/withdraw/create are signed in the mounted wallet, and cancel is signed server-side with the caller-supplied `senderSecret`. Do not add new server-side submit paths that sign with the keeper key, and do not wire pause/resume/withdraw to a server-side submit path.
+
+Signing custody across `backend/src/controllers/stream/*.ts` and `backend/src/services/sorobanService.ts` (verified by grepping for `KEEPER_SECRET_KEY`):
+
+- `topUpStream()` in `backend/src/services/sorobanService.ts` is the **only** caller of the keeper secret. If `KEEPER_SECRET_KEY` is unset it throws and the request returns `500`.
+- `cancelStream()` takes a `senderSecret` argument; `backend/src/controllers/stream/cancel.ts` reads it from `req.body.senderSecret`, so cancel is not custodial.
 
 ---
 
