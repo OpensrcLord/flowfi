@@ -4,21 +4,22 @@ const I128_MAX = (1n << 127n) - 1n;
 const I128_MIN = -(1n << 127n);
 
 export interface ClaimableStreamState {
-  streamId: number;
+  streamId: bigint;
+  tokenAddress: string;
   ratePerSecond: string;
   depositedAmount: string;
   withdrawnAmount: string;
-  startTime: number;
-  lastUpdateTime: number;
+  startTime: number | bigint;
+  lastUpdateTime: number | bigint;
   isActive: boolean;
   isPaused: boolean;
-  pausedAt: number | null;
+  pausedAt: number | bigint | null;
   totalPausedDuration: number;
   updatedAt?: Date;
 }
 
 export interface ClaimableAmountResult {
-  streamId: number;
+  streamId: bigint;
   claimableAmount: string;
   actionable: boolean;
   calculatedAt: number;
@@ -30,6 +31,15 @@ interface ClaimableServiceOptions {
   cacheTtlMs?: number;
   nowMs?: () => number;
 }
+
+/**
+ * Coarseness (in seconds) of the timestamp component in the claimable-amount
+ * cache key (Issue #1249). Without bucketing, the key embeds the current
+ * second, so sustained polling generates a fresh key every second per stream
+ * state and the cache Map grows continuously. Rounding to a 5s bucket cuts
+ * that key churn by ~5x while staying well within the 5s cache TTL.
+ */
+const CLAIMABLE_CACHE_BUCKET_SECONDS = 5;
 
 function clampI128(value: bigint): bigint {
   if (value > I128_MAX) return I128_MAX;
@@ -59,6 +69,7 @@ function getStateFingerprint(stream: ClaimableStreamState): string {
   // Always include lastUpdateTime to prevent cache collisions between streams
   // with different lastUpdateTime but same updatedAt (or no updatedAt)
   const baseFingerprint = [
+    stream.tokenAddress,
     stream.ratePerSecond,
     stream.depositedAmount,
     stream.withdrawnAmount,
@@ -102,7 +113,12 @@ export class ClaimableAmountService {
         ? Math.floor(requestedAt)
         : Math.floor(this.nowMs() / 1000);
 
-    const cacheKey = `claimable:${stream.streamId}:${getStateFingerprint(stream)}:${calculatedAt}`;
+    // Bucket the timestamp so requests landing within the same window share a
+    // cache entry instead of creating a new key every second.
+    const cacheKeyBucket =
+      Math.floor(calculatedAt / CLAIMABLE_CACHE_BUCKET_SECONDS) *
+      CLAIMABLE_CACHE_BUCKET_SECONDS;
+    const cacheKey = `claimable:${stream.streamId}:${getStateFingerprint(stream)}:${cacheKeyBucket}`;
     const cachedEntry = cache.get<Omit<ClaimableAmountResult, 'cached'>>(cacheKey);
 
     if (cachedEntry) {
@@ -114,14 +130,14 @@ export class ClaimableAmountService {
       };
     }
 
-    const anchorTime = BigInt(Math.max(0, stream.lastUpdateTime));
+    const anchorTime = BigInt(stream.lastUpdateTime) > 0n ? BigInt(stream.lastUpdateTime) : 0n;
     const nowTs = BigInt(Math.max(0, calculatedAt));
     let elapsed = nowTs > anchorTime ? nowTs - anchorTime : 0n;
 
     // Paused duration is handled by the contract updating lastUpdateTime on resume,
     // but we still account for it if it's currently paused.
-    if (stream.isPaused && stream.pausedAt !== null) {
-      const currentPauseStart = BigInt(Math.max(0, stream.pausedAt));
+    if (stream.isPaused && stream.pausedAt !== null && stream.pausedAt !== undefined) {
+      const currentPauseStart = BigInt(stream.pausedAt) > 0n ? BigInt(stream.pausedAt) : 0n;
       if (nowTs > currentPauseStart) {
         const currentPauseDuration = nowTs - currentPauseStart;
         elapsed = elapsed > currentPauseDuration ? elapsed - currentPauseDuration : 0n;
@@ -168,3 +184,169 @@ export const claimableAmountService = new ClaimableAmountService({
   cacheTtlMs: Number.isFinite(configuredCacheTtlMs) ? configuredCacheTtlMs : 5000,
 });
 
+
+export interface HistoricalSnapshotEvent {
+  eventType: string;
+  amount: string | null;
+  timestamp: number | bigint | string;
+  metadata: string | null;
+  ledgerSequence?: number;
+}
+
+export interface HistoricalSnapshotStream {
+  streamId: bigint;
+  ratePerSecond: string;
+  startTime: number | bigint | string;
+}
+
+export type HistoricalStreamStatus = 'NOT_STARTED' | 'ACTIVE' | 'PAUSED' | 'CANCELLED' | 'COMPLETED';
+
+export interface HistoricalStreamSnapshot {
+  streamId: string;
+  timestamp: number;
+  depositedAmount: string;
+  withdrawnAmount: string;
+  claimableAmount: string;
+  unvestedAmount: string;
+  statusAtTimestamp: HistoricalStreamStatus;
+}
+
+export class StreamSnapshotHistoryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StreamSnapshotHistoryError';
+  }
+}
+
+function parseSnapshotInteger(value: string | number | bigint | null | undefined, field: string): bigint {
+  if (value === null || value === undefined || value === '') throw new StreamSnapshotHistoryError(`Missing ${field} in stream history`);
+  try {
+    return BigInt(value);
+  } catch {
+    throw new StreamSnapshotHistoryError(`Invalid ${field} in stream history`);
+  }
+}
+
+function parseEventMetadata(event: HistoricalSnapshotEvent): Record<string, unknown> {
+  if (!event.metadata) return {};
+  try {
+    const value: unknown = JSON.parse(event.metadata);
+    return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  } catch {
+    throw new StreamSnapshotHistoryError(`Invalid metadata for ${event.eventType} event`);
+  }
+}
+
+function metadataInteger(metadata: Record<string, unknown>, key: string): bigint | null {
+  const value = metadata[key];
+  if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'bigint') return null;
+  try { return BigInt(value); } catch { return null; }
+}
+
+/**
+ * Replays indexed stream events and applies the contract's cumulative accrual
+ * rule at a historical Unix timestamp. StreamEvent.amount is an individual
+ * top-up/withdrawal except on COMPLETED, where the indexer records the
+ * cumulative withdrawn amount. CANCELLED metadata also carries the cumulative
+ * withdrawn amount.
+ */
+export function calculateHistoricalStreamSnapshot(
+  stream: HistoricalSnapshotStream,
+  events: HistoricalSnapshotEvent[],
+  targetTimestamp: number,
+): HistoricalStreamSnapshot {
+  const target = BigInt(targetTimestamp);
+  const startTime = parseSnapshotInteger(stream.startTime, 'startTime');
+  if (target < startTime) {
+    return {
+      streamId: stream.streamId.toString(), timestamp: targetTimestamp,
+      depositedAmount: '0', withdrawnAmount: '0', claimableAmount: '0',
+      unvestedAmount: '0', statusAtTimestamp: 'NOT_STARTED',
+    };
+  }
+
+  const history = events
+    .map((event) => ({ event, at: parseSnapshotInteger(event.timestamp, 'event timestamp') }))
+    .filter(({ at }) => at <= target)
+    .sort((a, b) => a.at < b.at ? -1 : a.at > b.at ? 1 : (a.event.ledgerSequence ?? 0) - (b.event.ledgerSequence ?? 0));
+  const creation = history.find(({ event }) => event.eventType === 'CREATED');
+  if (!creation) throw new StreamSnapshotHistoryError('Stream creation event is missing; historical balance cannot be reconstructed');
+
+  let deposited = parseSnapshotInteger(creation.event.amount, 'creation deposit');
+  let withdrawn = 0n;
+  let status: HistoricalStreamStatus = 'ACTIVE';
+  let openPause: bigint | null = null;
+  const pauses: Array<{ start: bigint; end: bigint }> = [];
+  let terminalAt: bigint | null = null;
+
+  for (const { event, at } of history) {
+    const metadata = parseEventMetadata(event);
+    switch (event.eventType) {
+      case 'CREATED':
+        status = 'ACTIVE';
+        break;
+      case 'TOPPED_UP': {
+        const newDeposited = metadataInteger(metadata, 'newDepositedAmount');
+        deposited = newDeposited ?? (deposited + parseSnapshotInteger(event.amount, 'top-up amount'));
+        break;
+      }
+      case 'WITHDRAWN':
+        withdrawn += parseSnapshotInteger(event.amount, 'withdrawal amount');
+        break;
+      case 'PAUSED':
+        openPause = metadataInteger(metadata, 'pausedAt') ?? at;
+        status = 'PAUSED';
+        break;
+      case 'RESUMED': {
+        if (openPause !== null) {
+          const pauseDuration = metadataInteger(metadata, 'pausedDuration');
+          const resumedAt = pauseDuration === null ? at : openPause + pauseDuration;
+          pauses.push({ start: openPause, end: resumedAt < at ? resumedAt : at });
+          openPause = null;
+        }
+        status = 'ACTIVE';
+        break;
+      }
+      case 'CANCELLED': {
+        const totalWithdrawn = metadataInteger(metadata, 'amountWithdrawn');
+        const refunded = metadataInteger(metadata, 'refundedAmount') ?? parseSnapshotInteger(event.amount, 'cancel refund');
+        withdrawn = totalWithdrawn ?? (deposited - refunded);
+        terminalAt = at;
+        status = 'CANCELLED';
+        break;
+      }
+      case 'COMPLETED':
+        withdrawn = parseSnapshotInteger(event.amount, 'completed withdrawal');
+        terminalAt = at;
+        status = 'COMPLETED';
+        break;
+      default:
+        break;
+    }
+  }
+
+  const accrualEnd = terminalAt !== null && terminalAt < target ? terminalAt : target;
+  if (openPause !== null) pauses.push({ start: openPause, end: accrualEnd });
+  const elapsed = accrualEnd > startTime ? accrualEnd - startTime : 0n;
+  const pausedSeconds = pauses.reduce((total, pause) => {
+    const from = pause.start > startTime ? pause.start : startTime;
+    const to = pause.end < accrualEnd ? pause.end : accrualEnd;
+    return total + (to > from ? to - from : 0n);
+  }, 0n);
+  const activeSeconds = elapsed > pausedSeconds ? elapsed - pausedSeconds : 0n;
+  const rate = parseSnapshotInteger(stream.ratePerSecond, 'ratePerSecond');
+  if (rate <= 0n) throw new StreamSnapshotHistoryError('ratePerSecond must be positive');
+  const vested = activeSeconds * rate;
+  const accrued = vested < deposited ? vested : deposited;
+  const safeWithdrawn = withdrawn > deposited ? deposited : withdrawn;
+  const claimable = accrued > safeWithdrawn ? accrued - safeWithdrawn : 0n;
+  const remaining = deposited > safeWithdrawn ? deposited - safeWithdrawn : 0n;
+  const unvested = remaining > claimable ? remaining - claimable : 0n;
+
+  return {
+    streamId: stream.streamId.toString(), timestamp: targetTimestamp,
+    depositedAmount: deposited.toString(), withdrawnAmount: safeWithdrawn.toString(),
+    claimableAmount: claimable.toString(), unvestedAmount: unvested.toString(),
+    statusAtTimestamp: status,
+  };
+}

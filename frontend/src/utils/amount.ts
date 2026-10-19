@@ -37,9 +37,11 @@ export function streamProgressPercent(withdrawn: bigint, deposited: bigint): num
 
 /**
  * Alias for formatAmount - convert raw on-chain amount to human-readable string
+ * @param amount - Raw amount as bigint
+ * @param decimals - Token decimals; defaults to 7 (XLM stroops)
  * @deprecated Use formatAmount instead
  */
-export function fromStroops(amount: bigint, decimals: number): string {
+export function fromStroops(amount: bigint, decimals = 7): string {
   return formatAmount(amount, decimals);
 }
 
@@ -72,9 +74,11 @@ export function parseAmount(display: string, decimals: number): bigint {
 
 /**
  * Alias for parseAmount - convert human-readable to raw on-chain amount
+ * @param amount - Display string (e.g., "1.234")
+ * @param decimals - Token decimals; defaults to 7 (XLM stroops)
  * @deprecated Use parseAmount instead
  */
-export function toStroops(amount: string, decimals: number): bigint {
+export function toStroops(amount: string, decimals = 7): bigint {
   return parseAmount(amount, decimals);
 }
 
@@ -109,6 +113,51 @@ export function formatStreamRate(
   tokenSymbol: string = "USDC"
 ): string {
   return formatRate(ratePerSecond, decimals, tokenSymbol);
+}
+
+/**
+ * Truncate amount to specified decimal places without rounding
+ * @param amount - Amount as bigint
+ * @param decimals - Token decimals
+ * @param maxDisplayDecimals - Maximum decimal places to display
+ * @returns Truncated string
+ */
+export function truncateAmount(
+  amount: bigint,
+  decimals: number,
+  maxDisplayDecimals: number
+): string {
+  if (amount === 0n) return "0";
+
+  const factor = 10n ** BigInt(decimals);
+  const integerPart = amount / factor;
+  const fractionalPart = amount % factor;
+
+  if (fractionalPart === 0n) return integerPart.toString();
+
+  const fractionalStr = fractionalPart.toString().padStart(decimals, "0");
+  const truncatedFractional = fractionalStr.slice(0, maxDisplayDecimals);
+  const trimmedFractional = truncatedFractional.replace(/0+$/, "");
+
+  if (!trimmedFractional) return integerPart.toString();
+  return `${integerPart}.${trimmedFractional}`;
+}
+
+/**
+ * Format amount with compact notation (K, M, B) for large numbers
+ * @param amount - Amount as bigint
+ * @param decimals - Token decimals
+ * @returns Compact formatted string e.g., "1.5K"
+ */
+export function formatCompactAmount(amount: bigint, decimals: number): string {
+  const displayAmount = formatAmount(amount, decimals);
+  const num = parseFloat(displayAmount);
+
+  if (num === 0) return "0";
+  if (num < 1_000) return displayAmount;
+  if (num < 1_000_000) return `${(num / 1_000).toFixed(1)}K`;
+  if (num < 1_000_000_000) return `${(num / 1_000_000).toFixed(1)}M`;
+  return `${(num / 1_000_000_000).toFixed(1)}B`;
 }
 
 /**
@@ -327,4 +376,56 @@ export function getTokenDecimalsSync(
   }
 
   return 7; // Return default while fetching
+}
+
+/**
+ * Compact display formatting for large token balances (issue #1509).
+ *
+ * Returns BOTH a compact form ("1.45M", "12.5K") for the visible cell and the
+ * exact decimal string for a hover tooltip. Callers should always render the
+ * compact form and attach the exact form to `title=` (or an accessible label)
+ * so the full precision is never lost — only hidden.
+ *
+ *   formatTokenCompact(14_502_934_910_293n, 7)
+ *   // => { compact: "1.45M", exact: "1450293.4910293" }
+ *
+ * `decimals` is the token's fixed-point scale (7 for Stellar assets). The
+ * compact form uses the en locale's `compact` notation — the same
+ * "12.5K / 1.45M" shape the issue specifies. The exact form is trimmed of
+ * trailing zeros so it reads like the raw on-chain amount rather than a
+ * padded fixed-width number.
+ */
+export function formatTokenCompact(
+  amount: bigint,
+  decimals: number,
+  opts: { locale?: string; maximumFractionDigits?: number } = {},
+): { compact: string; exact: string } {
+  const locale = opts.locale ?? "en";
+  const maxFractionDigits = opts.maximumFractionDigits ?? 2;
+
+  const negative = amount < 0n;
+  const abs = negative ? -amount : amount;
+  const divisor = 10n ** BigInt(decimals);
+  const whole = abs / divisor;
+  const frac = abs % divisor;
+
+  // Build the exact decimal string without float imprecision.
+  const fracStr = frac.toString().padStart(decimals, "0").replace(/0+$/, "");
+  const exactAbs = fracStr.length > 0 ? `${whole}.${fracStr}` : whole.toString();
+  const exact = negative ? `-${exactAbs}` : exactAbs;
+
+  // Convert to a Number only for the Intl compact formatting. Values beyond
+  // Number.MAX_SAFE_INTEGER lose sub-unit precision here, but that precision
+  // is already shown in `exact`, and the compact form is a display hint.
+  const asNumber = Number(exact);
+  // Below 10,000 the full grouped value already fits, so skip the K suffix
+  // (otherwise 9,999 would round up to "10K").
+  const compactAbs = new Intl.NumberFormat(locale, {
+    notation: Math.abs(asNumber) < 10_000 ? "standard" : "compact",
+    maximumFractionDigits: maxFractionDigits,
+  }).format(Math.abs(asNumber));
+
+  const compact = negative ? `-${compactAbs}` : compactAbs;
+
+  return { compact, exact };
 }

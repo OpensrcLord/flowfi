@@ -44,26 +44,38 @@ export function useStreamingAmount({
       !isPaused &&
       ratePerSecond > 0 &&
       maxClaimable > 0;
+    const reduceMotion =
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     let lastFrameTime = performance.now();
 
-    const nowSeconds = Date.now() / 1000;
-    const streamStartTime = startTime ?? lastUpdateTime ?? nowSeconds;
-    const elapsedSinceStart = Math.max(0, nowSeconds - streamStartTime);
-    const currentPauseDuration =
-      isPaused && pausedAt ? Math.max(0, nowSeconds - pausedAt) : 0;
-    const effectiveElapsed = Math.max(
-      0,
-      elapsedSinceStart - (startTime ? totalPausedDuration : 0) - currentPauseDuration,
-    );
+    const computeClaimable = () => {
+      const nowSeconds = Date.now() / 1000;
+      const streamStartTime = startTime ?? lastUpdateTime ?? nowSeconds;
+      const elapsedSinceStart = Math.max(0, nowSeconds - streamStartTime);
+      const currentPauseDuration =
+        isPaused && pausedAt ? Math.max(0, nowSeconds - pausedAt) : 0;
+      const effectiveElapsed = Math.max(
+        0,
+        elapsedSinceStart - (startTime ? totalPausedDuration : 0) - currentPauseDuration,
+      );
 
-    claimableRef.current = clamp(
-      effectiveElapsed * ratePerSecond,
-      0,
-      maxClaimable,
-    );
+      return clamp(effectiveElapsed * ratePerSecond, 0, maxClaimable);
+    };
+
+    claimableRef.current = computeClaimable();
     setClaimable(claimableRef.current);
 
     const tick = (frameTime: number) => {
+      if (document.hidden) {
+        // Skip recomputation while the tab is backgrounded; just keep
+        // rescheduling so we notice when it becomes visible again.
+        lastFrameTime = frameTime;
+        rafId = requestAnimationFrame(tick);
+        return;
+      }
+
       const deltaSeconds = Math.max(0, (frameTime - lastFrameTime) / 1000);
       lastFrameTime = frameTime;
 
@@ -79,11 +91,29 @@ export function useStreamingAmount({
       }
     };
 
-    if (isStreaming) {
+    const handleVisibilityChange = () => {
+      if (!document.hidden && isStreaming) {
+        // Resync to the true elapsed-time value instead of resuming from a
+        // stale tick, then continue ticking from the corrected value.
+        lastFrameTime = performance.now();
+        claimableRef.current = computeClaimable();
+        setClaimable(claimableRef.current);
+      }
+    };
+
+    if (reduceMotion && isStreaming) {
+      // #1198 — Respect prefers-reduced-motion: compute the accrued value once
+      // and skip the per-frame animation loop entirely.
+      claimableRef.current = computeClaimable();
+      setClaimable(claimableRef.current);
+    } else if (isStreaming) {
       rafId = requestAnimationFrame(tick);
     }
 
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
     return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
       if (rafId !== null) {
         cancelAnimationFrame(rafId);
       }
