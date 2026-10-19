@@ -21,6 +21,8 @@ updates:
           - "patch"
 
   # ── Cargo: contracts ───────────────────────────────────────────────────────
+  # Rust/soroban-sdk crate updates (including security patches) for the
+  # Soroban contracts under /contracts. Schedule mirrors the npm entry above.
   - package-ecosystem: "cargo"
     directory: "/contracts"
     schedule:
@@ -28,10 +30,9 @@ updates:
       day: "monday"
     open-pull-requests-limit: 5
     groups:
-      minor-and-patch:
-        update-types:
-          - "minor"
-          - "patch"
+      rust-dependencies:
+        patterns:
+          - "*"
 
   # ── GitHub Actions ─────────────────────────────────────────────────────────
   - package-ecosystem: "github-actions"

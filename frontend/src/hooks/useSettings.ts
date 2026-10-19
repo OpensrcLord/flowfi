@@ -2,94 +2,121 @@
 
 import { useState, useEffect, useCallback } from "react";
 
-export type Theme = "light" | "dark" | "system";
-export type DisplayCurrency = "USD" | "XLM" | "USDC";
+export type DisplayCurrency = "USD" | "EUR" | "GBP" | "XLM" | "USDC";
 export type AmountFormat = "full" | "compact";
 export type DecimalPlaces = 2 | 4 | 7;
 
 interface Settings {
-  theme: Theme;
   displayCurrency: DisplayCurrency;
   amountFormat: AmountFormat;
   decimalPlaces: DecimalPlaces;
 }
 
 const DEFAULT_SETTINGS: Settings = {
-  theme: "dark",
   displayCurrency: "USD",
   amountFormat: "full",
   decimalPlaces: 7,
 };
 
 const STORAGE_KEYS = {
-  theme: "flowfi-theme",
   displayCurrency: "flowfi-currency",
   amountFormat: "flowfi-amount-format",
   decimalPlaces: "flowfi-decimal-places",
 };
 
+let sharedSettings: Settings = { ...DEFAULT_SETTINGS };
+let sharedIsHydrated = false;
+const listeners = new Set<() => void>();
+
+function notifyListeners() {
+  listeners.forEach((listener) => listener());
+}
+
+function loadSettingsFromStorage(): Settings {
+  if (typeof window === "undefined") return { ...DEFAULT_SETTINGS };
+  const savedCurrency = localStorage.getItem(
+    STORAGE_KEYS.displayCurrency
+  ) as DisplayCurrency | null;
+  const savedFormat = localStorage.getItem(
+    STORAGE_KEYS.amountFormat
+  ) as AmountFormat | null;
+  const savedDecimals = localStorage.getItem(STORAGE_KEYS.decimalPlaces);
+
+  return {
+    displayCurrency: savedCurrency || DEFAULT_SETTINGS.displayCurrency,
+    amountFormat: savedFormat || DEFAULT_SETTINGS.amountFormat,
+    decimalPlaces: savedDecimals
+      ? (parseInt(savedDecimals, 10) as DecimalPlaces)
+      : DEFAULT_SETTINGS.decimalPlaces,
+  };
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (e) => {
+    if (!e.key || Object.values(STORAGE_KEYS).includes(e.key)) {
+      sharedSettings = loadSettingsFromStorage();
+      sharedIsHydrated = true;
+      notifyListeners();
+    }
+  });
+}
+
+// For testing purposes
+export function _resetSharedSettings() {
+  sharedSettings = { ...DEFAULT_SETTINGS };
+  sharedIsHydrated = false;
+  listeners.clear();
+}
+
 export function useSettings() {
-  const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
-  const [isHydrated, setIsHydrated] = useState(false);
+  const [settings, setSettingsState] = useState<Settings>(sharedSettings);
+  const [isHydrated, setIsHydrated] = useState(sharedIsHydrated);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    const listener = () => {
+      setSettingsState(sharedSettings);
+      setIsHydrated(sharedIsHydrated);
+    };
+    listeners.add(listener);
 
-    const savedTheme = localStorage.getItem(STORAGE_KEYS.theme) as Theme | null;
-    const savedCurrency = localStorage.getItem(
-      STORAGE_KEYS.displayCurrency
-    ) as DisplayCurrency | null;
-    const savedFormat = localStorage.getItem(
-      STORAGE_KEYS.amountFormat
-    ) as AmountFormat | null;
-    const savedDecimals = localStorage.getItem(STORAGE_KEYS.decimalPlaces);
-
-    // Use queueMicrotask to avoid synchronous setState in effect
-    queueMicrotask(() => {
-      setSettings({
-        theme: savedTheme || DEFAULT_SETTINGS.theme,
-        displayCurrency: savedCurrency || DEFAULT_SETTINGS.displayCurrency,
-        amountFormat: savedFormat || DEFAULT_SETTINGS.amountFormat,
-        decimalPlaces: savedDecimals
-          ? (parseInt(savedDecimals, 10) as DecimalPlaces)
-          : DEFAULT_SETTINGS.decimalPlaces,
+    if (!sharedIsHydrated && typeof window !== "undefined") {
+      queueMicrotask(() => {
+        if (!sharedIsHydrated) {
+          sharedSettings = loadSettingsFromStorage();
+          sharedIsHydrated = true;
+          notifyListeners();
+        }
       });
-      setIsHydrated(true);
-    });
-  }, []);
-
-  const setTheme = useCallback((theme: Theme) => {
-    setSettings((prev) => ({ ...prev, theme }));
-    localStorage.setItem(STORAGE_KEYS.theme, theme);
-
-    // Apply theme immediately
-    if (theme === "system") {
-      const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-      document.documentElement.classList.toggle("dark", prefersDark);
     } else {
-      document.documentElement.classList.toggle("dark", theme === "dark");
+      listener();
     }
+
+    return () => {
+      listeners.delete(listener);
+    };
   }, []);
 
   const setDisplayCurrency = useCallback((currency: DisplayCurrency) => {
-    setSettings((prev) => ({ ...prev, displayCurrency: currency }));
+    sharedSettings = { ...sharedSettings, displayCurrency: currency };
     localStorage.setItem(STORAGE_KEYS.displayCurrency, currency);
+    notifyListeners();
   }, []);
 
   const setAmountFormat = useCallback((format: AmountFormat) => {
-    setSettings((prev) => ({ ...prev, amountFormat: format }));
+    sharedSettings = { ...sharedSettings, amountFormat: format };
     localStorage.setItem(STORAGE_KEYS.amountFormat, format);
+    notifyListeners();
   }, []);
 
   const setDecimalPlaces = useCallback((places: DecimalPlaces) => {
-    setSettings((prev) => ({ ...prev, decimalPlaces: places }));
+    sharedSettings = { ...sharedSettings, decimalPlaces: places };
     localStorage.setItem(STORAGE_KEYS.decimalPlaces, places.toString());
+    notifyListeners();
   }, []);
 
   return {
     ...settings,
     isHydrated,
-    setTheme,
     setDisplayCurrency,
     setAmountFormat,
     setDecimalPlaces,
@@ -101,25 +128,6 @@ export function getDecimalPlaces(): DecimalPlaces {
   if (typeof window === "undefined") return 7;
   const saved = localStorage.getItem(STORAGE_KEYS.decimalPlaces);
   return saved ? (parseInt(saved, 10) as DecimalPlaces) : 7;
-}
-
-// Helper function to get theme synchronously
-export function getStoredTheme(): Theme {
-  if (typeof window === "undefined") return "dark";
-  return (localStorage.getItem(STORAGE_KEYS.theme) as Theme) || "dark";
-}
-
-// Apply theme immediately (useful for initial page load)
-export function applyStoredTheme(): void {
-  if (typeof window === "undefined") return;
-
-  const theme = getStoredTheme();
-  if (theme === "system") {
-    const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    document.documentElement.classList.toggle("dark", prefersDark);
-  } else {
-    document.documentElement.classList.toggle("dark", theme === "dark");
-  }
 }
 
 // Format amount based on user's decimal places preference
@@ -180,10 +188,14 @@ export default useSettings;
  * Usage examples:
  *
  * In React components:
- * const { theme, decimalPlaces, setTheme } = useSettings();
+ * const { decimalPlaces, setDecimalPlaces } = useSettings();
  *
  * For non-React code (utils, formatters):
  * const decimals = getDecimalPlaces(); // 2, 4, or 7
  * const formatted = formatAmountWithPreference(rawAmount, 7);
  * const format = getAmountFormat(); // 'full' or 'compact'
+ *
+ * For theme management, use next-themes' useTheme() hook instead:
+ * import { useTheme } from 'next-themes';
+ * const { theme, setTheme } = useTheme();
  */

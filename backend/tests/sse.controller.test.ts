@@ -71,6 +71,25 @@ describe('SSE Controller', () => {
     expect(sseService.addClient).toHaveBeenCalled();
   });
 
+  it('generates clientId with a CSPRNG instead of Math.random (#1534)', async () => {
+    (sseService.isShuttingDown as any).mockReturnValue(false);
+    (sseService.checkCapacity as any).mockReturnValue({ allowed: true });
+    (req as any).user = { publicKey: 'GUSER1' };
+    (prisma.stream.findMany as any).mockResolvedValue([]);
+
+    await subscribe(req as Request, res as Response);
+
+    const clientId = (sseService.addClient as any).mock.calls[0][0] as string;
+    expect(clientId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+
+    const connectedPayload = JSON.parse(
+      ((res.write as any).mock.calls[0][0] as string).replace(/^data: /, '').trim(),
+    );
+    expect(connectedPayload.clientId).toBe(clientId);
+  });
+
   it('should include user subscriptions when users query params are provided', async () => {
     (sseService.isShuttingDown as any).mockReturnValue(false);
     (sseService.checkCapacity as any).mockReturnValue({ allowed: true });
@@ -121,5 +140,32 @@ describe('SSE Controller', () => {
     expect(subscriptions).toContain('user:GUSER1');
     expect(subscriptions).toContain('user:GCOUNTER');
     expect(subscriptions).not.toContain('user:GOTHER');
+  });
+
+  it('should cap owned streams to MAX_SSE_STREAMS on reconnect (Issue #1246)', async () => {
+    (sseService.isShuttingDown as any).mockReturnValue(false);
+    (sseService.checkCapacity as any).mockReturnValue({ allowed: true });
+    (req as any).user = { publicKey: 'GUSER1' };
+
+    // Simulate a wallet with more streams than the cap
+    const manyStreams = Array.from({ length: 600 }, (_, i) => ({
+      streamId: String(i),
+      sender: 'GUSER1',
+      recipient: `GOTHER${i}`,
+    }));
+
+    // The controller should request take: MAX_SSE_STREAMS (500)
+    const cappedStreams = manyStreams.slice(0, 500);
+    (prisma.stream.findMany as any).mockResolvedValue(cappedStreams);
+
+    await subscribe(req as Request, res as Response);
+
+    // Verify the query was bounded
+    const findManyCall = (prisma.stream.findMany as any).mock.calls[0];
+    expect(findManyCall[0].take).toBe(500);
+
+    // The subscriptions should only contain the capped set + user subscription
+    const subscriptions = (sseService.addClient as any).mock.calls[0][2] as string[];
+    expect(subscriptions.length).toBeLessThanOrEqual(501); // 500 streams + user:GUSER1
   });
 });

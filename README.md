@@ -25,9 +25,22 @@ flowfi/
 │   ├── stream_contract/  # Core streaming logic
 ├── frontend/             # Next.js + Tailwind CSS frontend
 ├── docs/                 # Documentation
-│   ├── ARCHITECTURE.md   # Architecture overview
-│   └── DEVELOPMENT.md    # Local development guide
+│   ├── ARCHITECTURE.md      # Architecture overview
+│   ├── DEVELOPMENT.md       # Local development guide
+│   └── TROUBLESHOOTING.md   # FAQ: wallet, Friendbot, Soroban RPC
 ```
+
+
+
+For full step-by-step instructions, see our [Development Guide](docs/DEVELOPMENT.md).
+
+### Prerequisites
+
+- Node.js & npm
+- Rust & Cargo
+- Stellar CLI (optional but recommended)
+- Docker & Docker Compose (for containerized setup)
+
 
 ## Architecture
 
@@ -43,14 +56,7 @@ For full local setup and contributor onboarding, see the [Development Guide](doc
 
 ## Getting Started
 
-For full step-by-step instructions, see our [Development Guide](docs/DEVELOPMENT.md).
-
-### Prerequisites
-
-- Node.js & npm
-- Rust & Cargo
-- Stellar CLI (optional but recommended)
-- Docker & Docker Compose (for containerized setup)
+> **New here? Stuck on wallet setup?** See the [Troubleshooting & FAQ guide](docs/TROUBLESHOOTING.md) for switching Freighter between Testnet/Futurenet, funding test accounts with Stellar Friendbot, and resolving Soroban RPC rate-limit or simulation-timeout errors.
 
 ### Docker (Recommended)
 
@@ -83,18 +89,19 @@ To reset the database:
 docker compose down -v
 ```
 
-### Backend (Manual)
 
-```bash
-cd backend
-npm install
-npm run dev
-```
 
 ### Frontend
 
 ```bash
 cd frontend
+npm install
+npm run dev
+```
+### Backend (Manual)
+
+```bash
+cd backend
 npm install
 npm run dev
 ```
@@ -263,6 +270,15 @@ Contributions are welcome! Please see our [Contributing Guide](CONTRIBUTING.md) 
 Before your first change, run through the [Development Guide](docs/DEVELOPMENT.md) and review [Architecture Documentation](docs/ARCHITECTURE.md).
 
 For architecture details, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+### Architecture Decisions & Threat Model (auditor entry points)
+
+- **Architecture Decision Records:** [docs/adr/](docs/adr/) — TTL strategy, keeper-key deprecation, indexer cursor/dead-letter, SSE/WebSocket coexistence.
+- **STRIDE Threat Model:** [docs/security/STRIDE_THREAT_MODEL.md](docs/security/STRIDE_THREAT_MODEL.md) — trust boundaries, threat matrix, mitigations, residual risks.
+- **Batch Withdrawal Flow:** [docs/architecture/BATCH_WITHDRAWAL.md](docs/architecture/BATCH_WITHDRAWAL.md) — end-to-end sequence diagram for batch claims across frontend, SDK, contract, indexer, and SSE.
+- **TypeScript SDK (client-side signing):** [packages/flowfi-sdk/](packages/flowfi-sdk/) — standalone `FlowFiClient` for direct ledger access without the backend API.
+- **Preview environments:** every PR gets an ephemeral full-stack preview (migrated + seeded DB) via `.github/workflows/pr-preview.yml`; resources are torn down by `pr-preview-cleanup.yml` on close.
+- **Troubleshooting & FAQ:** [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — Freighter network switching, Friendbot funding, and Soroban RPC errors.
 
 ## Security
 
