@@ -4,11 +4,11 @@ import { Card } from './ui/Card';
 const faqs = [
     {
         q: 'How safe are the smart contracts?',
-        a: 'FlowFi uses battle-tested, non-upgradable smart contracts. We have been audited by top-tier firms including OpenZeppelin and ConsenSys Diligence.',
+        a: 'FlowFi uses non-upgradable Soroban smart contracts on Stellar. The contracts have not yet been independently audited; a third-party security audit is planned before mainnet launch.',
     },
     {
         q: 'Which chains do you support?',
-        a: 'We are currently live on Ethereum Mainnet, Arbitrum, and Optimism. Polygon and Base support is coming in Q3 2026.',
+        a: 'FlowFi is built on Stellar using Soroban smart contracts. We currently run on Stellar Testnet, with mainnet support planned as the protocol matures.',
     },
     {
         q: 'Can recipients withdraw at any time?',
